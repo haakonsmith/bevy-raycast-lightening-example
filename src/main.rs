@@ -1,13 +1,13 @@
-use bevy::prelude::*;
 use bevy::reflect::List;
+use bevy::render::pipeline::PrimitiveTopology;
+use bevy::{prelude::*, window};
 use bevy_prototype_debug_lines::*;
-use c2::{self, RayCast};
-use c2::{prelude::*, Capsule, Circle, Poly, Ray, Rotation, Transformation};
 // use parry2d::math::{Point, Vector};
-use parry2d::na::{Isometry2, Point2};
+use parry2d::na::{ComplexField, Isometry2, Norm, Point2, Vector2};
+use parry2d::query::{Ray, RayCast};
 use parry2d::shape::ConvexPolygon;
-use std::cmp::min;
 use std::f32::consts::PI;
+use std::convert::TryFrom;
 
 const PLAYER_SPRITE: &str = "img_test.png";
 
@@ -22,8 +22,9 @@ pub struct MyRaycastSet;
 
 pub struct ShadowCaster;
 
-fn C2into(vec: c2::Vec2) -> Vec3 {
-    return Vec3::new(vec.x(), vec.y(), 0.0);
+pub struct ShadowMeshData {
+    pub vertices: Vec<Vec3>,
+    pub indices: Vec<u32>,
 }
 
 // main
@@ -37,10 +38,10 @@ fn main() {
             "setup_game_actors",
             SystemStage::single(spawn_player.system()),
         )
-        .add_system(draw_occulsion_debug_bounds.system())
-        // .add_system(cast_rays.system())
         .add_system(player_movement.system())
         .add_system(player_mouse.system())
+        .add_system(draw_occulsion_debug_bounds.system())
+        .add_system(cast_rays.system())
         .run();
 }
 
@@ -50,7 +51,10 @@ fn setup(
     mut commands: Commands,
     mut materials: ResMut<Assets<ColorMaterial>>,
     asset_server: Res<AssetServer>,
+    windows: Res<Windows>,
 ) {
+    let window = windows.get_primary().unwrap();
+
     commands.spawn_bundle(OrthographicCameraBundle::new_2d());
 
     commands.insert_resource(Materials {
@@ -60,27 +64,49 @@ fn setup(
     commands
         .spawn()
         .insert(Transform {
+            translation: Vec3::new(0., 0., 1.),
+            scale: Vec3::new(1., 1., 1.),
+            // rotation: Quat::from_rotation_z(1.),
+            ..Default::default()
+        })
+        .insert(
+            parry2d::shape::ConvexPolygon::from_convex_polyline(vec![
+                Point2::new(-window.width() / 2., -window.height() / 2. + 10.),
+                Point2::new(-window.width() / 2., -window.height() / 2. - 10.),
+                Point2::new(window.width() / 2., -window.height() / 2. - 10.),
+                Point2::new(window.width() / 2., -window.height() / 2. + 10.),
+            ])
+            .unwrap(),
+        )
+        .insert(ShadowCaster);
+
+    commands
+        .spawn()
+        .insert(Transform {
             translation: Vec3::new(20.5, 0.5, 1.),
             scale: Vec3::new(1., 1., 1.),
             rotation: Quat::from_rotation_z(1.),
             ..Default::default()
         })
-        .insert(Poly::from_slice(&[
-            [-5.0, -15.0],
-            [5.0, -15.0],
-            [5.0, 0.0],
-            [0.0, 5.0],
-            [-5.0, 0.0],
-        ]))
+        .insert(
+            parry2d::shape::ConvexPolygon::from_convex_polyline(vec![
+                Point2::new(-5.0, -15.0),
+                Point2::new(5.0, -15.0),
+                Point2::new(5.0, 15.0),
+            ])
+            .unwrap(),
+        )
         .insert(ShadowCaster);
 }
 
 fn spawn_player(mut commands: Commands, materials: Res<Materials>) {
     let poly = parry2d::shape::ConvexPolygon::from_convex_polyline(vec![
-        Point2::new(-5.0, -15.0),
-        Point2::new(5.0, -15.0),
-        Point2::new(5.0, 15.0),
-    ]).unwrap();
+        Point2::new(-15.0, -15.0),
+        Point2::new(15.0, -15.0),
+        Point2::new(15.0, 15.0),
+        Point2::new(-15.0, 15.0),
+    ])
+    .unwrap();
 
     commands
         .spawn_bundle(SpriteBundle {
@@ -103,8 +129,6 @@ fn player_movement(
     mut query: Query<(&mut Transform, With<Player>)>,
 ) {
     if let Ok((mut transform, _)) = query.single_mut() {
-        // let dir = if keyboard_input.pressed(KeyCode::A)
-
         let mut dir: Vec2 = Vec2::new(0., 0.);
 
         if keyboard_input.pressed(KeyCode::A) {
@@ -120,7 +144,7 @@ fn player_movement(
             dir.y += 1.;
         };
 
-        dir *= 1.;
+        dir *= 5.;
 
         transform.translation.x += dir.x;
         transform.translation.y += dir.y;
@@ -138,10 +162,6 @@ fn player_mouse(windows: Res<Windows>, mut query: Query<(&mut Transform, With<Pl
             let diff = transform.translation.truncate() - m_pos;
             let angle = diff.y.atan2(diff.x) + PI; // Add/sub FRAC_PI here optionally
 
-            // if angle != transform.rotation.to_axis_angle().1 {
-            //     print!("{:?}\n", angle);
-            // }
-
             transform.rotation = Quat::from_rotation_z(angle);
         }
     }
@@ -151,158 +171,193 @@ fn draw_occulsion_debug_bounds(
     mut query: Query<(&Transform, &parry2d::shape::ConvexPolygon)>,
     mut lines: ResMut<DebugLines>,
 ) {
-    print!("test\n");
-    for (_transform, poly) in query.iter_mut() {
-        print!("test2\n");
-        // let transformation = Transformation::new(
-        //     c2::Vec2::new(transform.translation.x, transform.translation.y),
-        //     Rotation::radians(PI / 2.0),
-        // );
+    for (transform, poly) in query.iter_mut() {
         let points = poly.points();
-        print!("{:?}\n", points);
+
+        let iso = to_parry(transform);
 
         for i in 0..points.len() {
-            let next_index = if i + 1 > points.len() { 0 } else { i + 1 };
+            let next_index = if i + 1 > points.len() - 1 { 0 } else { i + 1 };
 
-            let p1 = points[i];
-            let p2 = points[next_index];
-
-            print!("{:?}\n", p1.x);
+            let p1 = iso * points[i];
+            let p2 = iso * points[next_index];
 
             lines.line(Vec3::new(p1.x, p1.y, 0.), Vec3::new(p2.x, p2.y, 0.), 0.);
         }
-
-        // print!("{:?}", transform.mul_vec3(untransformed1));
-        // }
-
-        // let start = Vec3::splat(-10.0);
-        // let end = Vec3::splat(10.0);
-        // let duration = 0.0;
-        // lines.line(start, end, duration);
     }
 }
 
 fn cast_rays(
-    mut query: Query<(&Transform, &Poly, With<ShadowCaster>)>,
+    mut query: Query<(
+        &Transform,
+        &parry2d::shape::ConvexPolygon,
+        With<ShadowCaster>,
+    )>,
     mut lines: ResMut<DebugLines>,
 ) {
-    // let points = get_points_for_raycast(&mut query);
+    // let mut shadow_mesh = ShadowMeshData {
+    //     indices: vec![],
+    //     vertices: vec![],
+    // };
 
-    // for point in points {
-    //     let start = c2::Vec2::new(0., 0.);
-    //     let ray = Ray::new(start, point - start);
+    let points = get_points_for_raycast(&mut query);
 
-    //     // print!("{:?}", ray.end());
+    let mut vertices: Vec<[f32; 3]> = Vec::with_capacity(points.len() * 3);
+    let origin = Point2::<f32>::new(0., 0.);
 
-    //     let ray_cast = ray_cast_to_query(&ray, &mut query);
+    for point in points {
 
-    //     // print!("{:?}\n", ray_cast);
+        let diff = point - origin;
+        let angle = diff.y.atan2(diff.x);
 
-    //     if let Some(cast) = ray_cast {
-    //         draw_ray_cast(ray.clone(), &cast, &mut lines)
-    //     }
-    // }
+        let min = Ray::new(
+            origin,
+            Vector2::new((angle - 0.001).cos(), (angle - 0.001).sin()),
+        );
+        let max = Ray::new(
+            origin,
+            Vector2::new((angle + 0.001).cos(), (angle + 0.001).sin()),
+        );
+        let ray = Ray::new(origin, (point - origin).normalize());
 
+        let ray_cast = ray_cast_to_query(&ray, 1000., &mut query);
+
+        if let Some(cast) = ray_cast {
+            
+            draw_ray_cast(ray, cast, &mut lines);
+        } else {
+            draw_ray_cast(ray, (point - origin).magnitude(), &mut lines);
+        }
+
+        let ray_cast = ray_cast_to_query(&min, 10000., &mut query);
+
+        if let Some(cast) = ray_cast {
+            let end = ray.dir * cast;
+            vertices.push([end.x, end.y, 0.]);
+            draw_ray_cast(min, cast, &mut lines);
+        } else {
+            draw_ray_cast(min, 1000., &mut lines);
+        }
+
+        let ray_cast = ray_cast_to_query(&max, 10000., &mut query);
+
+        if let Some(cast) = ray_cast {
+            let end = ray.dir * cast;
+            vertices.push([end.x, end.y, 0.]);
+            draw_ray_cast(max, cast, &mut lines);
+        } else {
+            draw_ray_cast(max, 1000., &mut lines);
+        }
+
+        // let mut indices : Vec::<u32> = Vec::new();
+        // let mut colors  : Vec::<[f32; 3]> = Vec::new();
+
+        // for vertex in &shadow_mesh.vertices {
+        //     vertices.push([vertex.x, vertex.y, vertex.z]);
+        // }
+
+        // let mesh = Mesh::new(PrimitiveTopology::LineList);
+
+        vertices.sort_by(|a,b| {
+            // (a[0]*a[0] + a[1]*a[1]).partial_cmp(&(b[0]*b[0] + b[1]*b[1])).unwrap()
+            // let distance_a = origin.to_homogeneous().metric_distance(&parry2d::na::Vector3::new(a[0], a[1], a[2]));
+            // let distance_b = origin.to_homogeneous().metric_distance(&parry2d::na::Vector3::new(b[0], b[1], b[2]));
+            let a_diff = Vec2::from_slice_unaligned(a) - Vec2::new(origin.x, origin.y);
+            let b_diff = Vec2::from_slice_unaligned(b) - Vec2::new(origin.x, origin.y);
+
+            a_diff.y.atan2(a_diff.x).partial_cmp(&b_diff.y.atan2(b_diff.x)).unwrap()
+
+            // (distance_a).partial_cmp(&(distance_b)).unwrap()
+        });
+
+        // print!("{:?}\n", &vertices);
+
+        draw_mesh_outline_debug(&vertices, &mut lines);
+
+        // let ray_cast = ray_cast_to_query(&ray, 1000., &mut query, Some(poly));
+    }
     // let ray = Ray::new(c2::Vec2::new(0., 0.), c2::Vec2::new(smallest_distance, 0.));
 }
 
+fn draw_mesh_outline_debug(vertices: &Vec<[f32; 3]>, lines: &mut ResMut<DebugLines>) {
+    for i in 0..vertices.len() {
+        let next_index = if i + 1 > vertices.len() - 1 { 0 } else { i + 1 };
+
+        lines.line(
+            Vec3::from_slice_unaligned(&vertices[i]),
+            Vec3::from_slice_unaligned(&vertices[next_index]),
+            0.
+        )
+    }
+}
+
+/// Returns a time of impact
 fn ray_cast_to_query(
     ray: &Ray,
-    query: &mut Query<(&Transform, &Poly, With<ShadowCaster>)>,
-) -> Option<RayCast> {
-    let mut smallest_raycast: Option<RayCast> = None;
+    max_toi: f32,
+    query: &mut Query<(&Transform, &ConvexPolygon, With<ShadowCaster>)>,
+) -> Option<f32> {
+    let mut smallest_raycast: Option<f32> = None;
 
     for (transform, poly, _) in query.iter_mut() {
-        let collision_ray = Ray::new(ray.start(), ray.end());
+        let transformation = to_parry(transform);
 
-        // print!("{:?}", ray.end());
-
-        let transformation = Transformation::new(
-            c2::Vec2::new(transform.translation.x, transform.translation.y),
-            Rotation::radians(transform.rotation.to_axis_angle().1),
-        );
-
-        let cast: RayCast;
-
-        if let Some(ray_cast) = collision_ray.cast(transform_c2_poly(transform, *poly)) {
-            cast = ray_cast;
-        } else {
-            cast = RayCast::new(ray.end().distance(ray.start()), ray.start());
-        }
-
-        if let Some(result) = smallest_raycast {
-            if cast.time_of_impact() < result.time_of_impact() {
-                print!("{:?}\n", cast.time_of_impact());
-                smallest_raycast = Some(cast);
+        if let Some(ray_cast) = poly.cast_ray(&transformation, ray, max_toi, true) {
+            if let Some(smallest_cast) = smallest_raycast {
+                if smallest_cast > ray_cast {
+                    smallest_raycast = Some(ray_cast);
+                }
+            } else {
+                smallest_raycast = Some(ray_cast);
             }
-        } else {
-            smallest_raycast = Some(cast);
         }
     }
 
     return smallest_raycast;
 }
 
-fn draw_ray_cast(ray: Ray, ray_cast: &RayCast, lines: &mut ResMut<DebugLines>) {
-    let start = ray.start();
-    let end = ray_cast.position_of_impact(ray);
+fn draw_ray_cast(ray: parry2d::query::Ray, toi: f32, lines: &mut ResMut<DebugLines>) {
+    return;
 
-    lines.line(
-        Vec3::new(start.x(), start.y(), 0.),
-        Vec3::new(end.x(), end.y(), 0.),
-        0.,
-    );
+    let start = ray.origin;
+    let end = ray.dir * toi;
+    let my_span = info_span!("draw_ray_cast()", name = "draw_ray_cast()");
+    {
+        let guard = my_span.enter();
+
+        lines.line(
+            Vec3::new(start.x, start.y, 0.),
+            Vec3::new(end.x, end.y, 0.),
+            0.,
+        );
+    }
 }
 
 fn get_points_for_raycast(
-    query: &mut Query<(&Transform, &Poly, With<ShadowCaster>)>,
-) -> Vec<c2::Vec2> {
-    let mut points = Vec::<c2::Vec2>::new();
+    query: &mut Query<(&Transform, &ConvexPolygon, With<ShadowCaster>)>,
+) -> Vec<Point2<f32>> {
+    let mut points = Vec::<Point2<f32>>::new();
 
     for (transform, poly, _) in query.iter_mut() {
-        for i in 0..poly.count() {
-            points.push(transform_c2(transform, poly.get_vert(i)));
+        let iso = to_parry(transform);
+
+        let _points = poly.points();
+
+        for i in 0.._points.len() {
+            points.push(iso * _points[i]);
         }
     }
-
-    points.push(c2::Vec2::new(1000., 0.));
-    points.push(c2::Vec2::new(-1000., 0.));
 
     points
 }
 
-fn transform_c2(transform: &Transform, vec: c2::Vec2) -> c2::Vec2 {
-    let untransformed = C2into(vec);
-    let mut copy = transform.clone();
-    copy.scale = Vec3::splat(1.);
-    let transformed = copy.mul_vec3(untransformed);
-
-    c2::Vec2::new(transformed.x, transformed.y)
-}
-
-fn transform_c2_poly(transform: &Transform, poly: Poly) -> Poly {
-    let mut copy = transform.clone();
-    copy.scale = Vec3::splat(1.);
-
-    let mut points = [[0. as f32; 2]; 8];
-
-    for i in 0..poly.count() {
-        let p = transform_c2(&copy, poly.get_vert(i));
-        points[i] = [p.x(), p.y()];
-    }
-
-    Poly::from_array(points.len(), points)
-}
-
-fn to_parry(transform: Transform) -> parry2d::math::Isometry<f32> {
-    // let translation = parry2d::math::Translation::new(transform.translation.x, transform.translation.y);
-    // let rotation = parry2d::math::Rotation::new(transform.rotation.to_axis_angle().1);
-    // let scale = parry2d::math::Scale
-
+fn to_parry(transform: &Transform) -> parry2d::math::Isometry<f32> {
     return Isometry2::new(
         parry2d::na::Vector2::new(transform.translation.x, transform.translation.y),
         transform.rotation.to_axis_angle().1,
     );
 }
+
+fn render_shadow_mesh() {}
 
 // Burnt as in like, people intrepreting me talking to them and getting close even though I explicitly stated that I didn't want to get close, and we'd agreed that we'd just go with the flow as: "let's have kids together"
