@@ -9,4 +9,4 @@ edition = "2018"
 bevy = "0.5"
 bevy_prototype_debug_lines = "0.3.2"
 c2 = { path = "./lib/cute-c2/cute-c2" }
-bevy_mod_raycast = { git = "https://github.com/aevyrie/bevy_mod_raycast", branch = "master", version = "0.2" }
+parry2d = "0.7.1"
